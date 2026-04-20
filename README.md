@@ -75,6 +75,31 @@ All speaker turns within a section are concatenated into a single text, then chu
 
 **Why both?** Sentiment in financial text is often expressed across sentence and turn boundaries. A CFO might hedge a strong statement in the following sentence, or a CEO might qualify remarks made earlier in the same section. The non-overlap strategy can split these in half — one chunk gets the positive signal, the next gets the hedge — and the sentiment averages out. The overlap strategy mitigates this by ensuring that every sentence appears in at least two chunks. Both strategies are scored and compared during signal testing to determine which produces more predictive sentiment signals. The overlap chunk count is typically ~70% of the non-overlap count (not double, because the 50% stride advances by half a window at a time and many turns are short enough to fit in a single chunk under either strategy).
 
+## Return calculation (CAR)
+
+Post-earnings stock performance is measured as **Cumulative Abnormal Return (CAR)** — the stock's return minus the S&P 500 (SPY) return over 1, 3, and 5 trading days following the call.
+
+### Earnings window timing
+
+Getting the start of the return window right matters. The rule used here:
+
+- **Call before 4:00 p.m. ET** (morning or midday) → window starts on the earnings date itself. The market is open and reacts immediately; using the same calendar day captures the full reaction and avoids losing a day of signal.
+- **Call at or after 4:00 p.m. ET** (after market close) → window starts the *next* trading day. The market is closed when the call happens, so the earliest possible reaction is the following morning. Using the earnings date here would capture pre-call returns — noise, not signal.
+- **Time unknown** → next trading day (conservative fallback).
+
+Call times are extracted directly from the raw dataset timestamps (e.g. "Aug 27, 2020, 9:00 p.m. ET"). This is preferable to defaulting all events to next-day, because morning calls — which make up a meaningful portion of the dataset — lose a full day of reaction time under a conservative blanket rule, compressing the measurable signal.
+
+### Sample coverage and survivorship bias
+
+20.1% of earnings events (3,526 of 17,542) are excluded from the return analysis due to missing price data — yfinance cannot find historical prices for tickers that have since been delisted, acquired, renamed, or taken private. These 670 missing tickers are disproportionately **small-cap companies**: the excluded events have a median market cap of $1.1B vs $5.0B for the retained sample. Healthcare (likely small-cap biotech/pharma) and Communication Services are overrepresented among the missing.
+
+This introduces survivorship bias. The analysis sample skews toward larger, more established companies that continued trading through 2017–2023. Companies that failed or underwent distressed M&A are largely absent. Signal findings are more applicable to mid- and large-cap equities — extrapolating to small-cap or speculative names should be done with caution.
+
+### Benchmark and adjustment methods
+
+- **Primary**: market-adjusted CAR — stock return minus SPY return each day, summed over the window
+- **Robustness check**: beta-adjusted CAR — expected return is beta × SPY return, where beta is estimated on the 120 trading days prior to the event (non-overlapping with the CAR window)
+
 ## FinBERT inference
 
 Model: [ProsusAI/finbert](https://huggingface.co/ProsusAI/finbert) via HuggingFace Transformers. Three output probabilities per chunk: `positive_prob`, `negative_prob`, `neutral_prob` (sum to 1.0).
