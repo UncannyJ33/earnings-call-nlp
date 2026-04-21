@@ -1,16 +1,28 @@
 """
-src/signal_testing.py — Correlation analysis and OLS regression for sentiment signals.
+src/signal_testing.py — Correlation analysis, OLS regression, and strategy tests.
 
 Tests whether FinBERT-derived sentiment features predict post-earnings
 cumulative abnormal returns (CAR).
 
-Pipeline:
-  1. correlation_analysis()   — Pearson + Spearman for each feature × CAR window
-  2. regression_analysis()    — OLS with HC3 robust SEs, VIF checks
-  3. apply_bonferroni()       — Multiple-testing correction across all tests
+Pipeline (part 1):
+  1. correlation_analysis()     — Pearson + Spearman for each feature × CAR window
+  2. regression_analysis()      — OLS with HC3 robust SEs, VIF checks
+  3. apply_bonferroni()         — Multiple-testing correction across all tests
+
+Pipeline (part 2):
+  4. quantile_analysis()        — Q4-Q1 spread and monotonicity test
+  5. quantile_by_period()       — Spread by year (alpha decay test)
+  6. quantile_by_sector()       — Spread by sector
+  7. robustness_checks()        — Beta-adjusted CAR + overlap chunking comparison
+  8. out_of_sample_test()       — Train/test split on quantile thresholds
 
 Usage:
-    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py
+    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py            # part 1
+    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py --step5    # quantile analysis
+    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py --step6    # period breakdown
+    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py --step7    # sector breakdown
+    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py --step8    # robustness checks
+    PYTHONPATH=. .venv/bin/python3.12 src/signal_testing.py --step9 --train-end 2021
 """
 
 import logging
@@ -319,6 +331,402 @@ def apply_bonferroni(
 
 
 # ---------------------------------------------------------------------------
+# 4. Quantile analysis
+# ---------------------------------------------------------------------------
+
+def quantile_analysis(
+    df: pd.DataFrame,
+    feature: str,
+    car_column: str,
+    n_quantiles: int = 4,
+) -> tuple[pd.DataFrame, dict]:
+    """Divide earnings events into quantile groups by feature and compare CAR.
+
+    Rows with NaN in either the feature or CAR column are excluded. Quantile
+    boundaries are computed on the remaining rows so every group has equal size.
+
+    Args:
+        df: analysis_ready DataFrame.
+        feature: sentiment feature column to sort by.
+        car_column: CAR column to use as the outcome.
+        n_quantiles: number of equal-sized groups (default 4 = quartiles).
+
+    Returns:
+        Tuple of:
+          summary_df — DataFrame with one row per quantile:
+              quantile (1..n), label, n, mean_car, median_car, std_car,
+              min_car, max_car, feature_mean (mean feature value in group)
+          spread_dict — {
+              q4_mean, q1_mean, spread (Q4-Q1),
+              t_stat, p_value, is_significant (p < 0.05),
+              n_q4, n_q1
+          }
+    """
+    sub = df[[feature, car_column]].dropna().copy()
+    sub["quantile"] = pd.qcut(sub[feature], q=n_quantiles, labels=False) + 1
+
+    records = []
+    for q in range(1, n_quantiles + 1):
+        grp = sub.loc[sub["quantile"] == q, car_column]
+        feat_grp = sub.loc[sub["quantile"] == q, feature]
+        label = (
+            "Q1 (bottom)" if q == 1
+            else f"Q{n_quantiles} (top)" if q == n_quantiles
+            else f"Q{q}"
+        )
+        records.append({
+            "quantile": q,
+            "label": label,
+            "n": len(grp),
+            "mean_car": round(grp.mean(), 6),
+            "median_car": round(grp.median(), 6),
+            "std_car": round(grp.std(), 6),
+            "min_car": round(grp.min(), 6),
+            "max_car": round(grp.max(), 6),
+            "feature_mean": round(feat_grp.mean(), 6),
+        })
+
+    summary_df = pd.DataFrame(records)
+
+    # Q4 vs Q1 t-test (Welch, unequal variance)
+    q1_vals = sub.loc[sub["quantile"] == 1, car_column].values
+    qn_vals = sub.loc[sub["quantile"] == n_quantiles, car_column].values
+    t_stat, p_val = stats.ttest_ind(qn_vals, q1_vals, equal_var=False)
+
+    spread_dict = {
+        "q4_mean": round(float(qn_vals.mean()), 6),
+        "q1_mean": round(float(q1_vals.mean()), 6),
+        "spread": round(float(qn_vals.mean() - q1_vals.mean()), 6),
+        "t_stat": round(t_stat, 4),
+        "p_value": round(p_val, 6),
+        "is_significant": bool(p_val < 0.05),
+        "n_q4": len(qn_vals),
+        "n_q1": len(q1_vals),
+    }
+
+    logger.info(
+        "quantile_analysis: %s → %s, spread=%.4f, p=%.4f",
+        feature, car_column, spread_dict["spread"], p_val,
+    )
+    return summary_df, spread_dict
+
+
+# ---------------------------------------------------------------------------
+# 5. Quantile spread by year (alpha decay test)
+# ---------------------------------------------------------------------------
+
+def quantile_by_period(
+    df: pd.DataFrame,
+    feature: str,
+    car_column: str,
+    period_col: str = "year",
+) -> pd.DataFrame:
+    """Run quantile analysis separately for each year and track Q4-Q1 spread.
+
+    Used as an alpha decay test: if the signal is being arbitraged away,
+    the spread should shrink in later years.
+
+    Args:
+        df: analysis_ready DataFrame. Must contain a 'year' column or
+            the specified period_col.
+        feature: sentiment feature to sort by.
+        car_column: CAR outcome column.
+        period_col: column to group by (default 'year').
+
+    Returns:
+        DataFrame with one row per period:
+            year, n_events, q1_mean, q4_mean, spread, t_stat, p_value,
+            is_significant
+    """
+    work = df.copy()
+    if period_col not in work.columns:
+        work[period_col] = work["date"].dt.year
+
+    periods = sorted(work[period_col].dropna().unique())
+    records = []
+    for period in periods:
+        sub = work[work[period_col] == period]
+        if sub[[feature, car_column]].dropna().shape[0] < 50:
+            logger.warning(
+                "quantile_by_period: period=%s has fewer than 50 complete rows — skipping",
+                period,
+            )
+            continue
+        _, spread = quantile_analysis(sub, feature, car_column, n_quantiles=4)
+        records.append({
+            period_col: int(period),
+            "n_events": spread["n_q4"] + spread["n_q1"],
+            "q1_mean": spread["q1_mean"],
+            "q4_mean": spread["q4_mean"],
+            "spread": spread["spread"],
+            "t_stat": spread["t_stat"],
+            "p_value": spread["p_value"],
+            "is_significant": spread["is_significant"],
+        })
+
+    result = pd.DataFrame(records)
+    logger.info(
+        "quantile_by_period: %d periods, spread range [%.4f, %.4f]",
+        len(result), result["spread"].min(), result["spread"].max(),
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 6. Quantile spread by sector
+# ---------------------------------------------------------------------------
+
+def quantile_by_sector(
+    df: pd.DataFrame,
+    feature: str,
+    car_column: str,
+) -> pd.DataFrame:
+    """Run quantile analysis separately for each sector.
+
+    Sectors with fewer than 100 complete observations are skipped — too
+    few events to form reliable quartiles.
+
+    Args:
+        df: analysis_ready DataFrame with a 'sector' column.
+        feature: sentiment feature to sort by.
+        car_column: CAR outcome column.
+
+    Returns:
+        DataFrame with one row per sector:
+            sector, n_events, q1_mean, q4_mean, spread, t_stat, p_value,
+            is_significant
+        Sorted by spread descending.
+    """
+    if "sector" not in df.columns:
+        raise ValueError("DataFrame must contain a 'sector' column")
+
+    sectors = df["sector"].dropna().unique()
+    records = []
+    for sector in sectors:
+        sub = df[df["sector"] == sector]
+        complete = sub[[feature, car_column]].dropna().shape[0]
+        if complete < 100:
+            logger.warning(
+                "quantile_by_sector: sector=%s has %d complete rows — skipping",
+                sector, complete,
+            )
+            continue
+        _, spread = quantile_analysis(sub, feature, car_column, n_quantiles=4)
+        records.append({
+            "sector": sector,
+            "n_events": complete,
+            "q1_mean": spread["q1_mean"],
+            "q4_mean": spread["q4_mean"],
+            "spread": spread["spread"],
+            "t_stat": spread["t_stat"],
+            "p_value": spread["p_value"],
+            "is_significant": spread["is_significant"],
+        })
+
+    result = pd.DataFrame(records).sort_values("spread", ascending=False).reset_index(drop=True)
+    logger.info("quantile_by_sector: %d sectors with sufficient data", len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 7. Robustness checks
+# ---------------------------------------------------------------------------
+
+def robustness_checks(df: pd.DataFrame) -> dict:
+    """Re-run primary regression with beta-adjusted CAR and overlap chunking.
+
+    Two robustness checks:
+      A. Beta-adjusted CAR: swap market-adjusted CAR_3d for beta_CAR_3d and
+         re-run the reduced regression. If coefficients are similar, the
+         signal is not an artefact of how the market return is benchmarked.
+      B. Overlap chunking: load finbert_scores_overlap.parquet, recompute
+         the feature matrix, run the same correlation analysis, and compare
+         Spearman r values for the three primary features against non-overlap.
+
+    Args:
+        df: analysis_ready DataFrame (already has beta_CAR_3d column).
+
+    Returns:
+        dict with keys:
+            beta_car_result   — regression_analysis output for beta_CAR_3d
+            market_car_result — regression_analysis output for CAR_3d (reference)
+            overlap_corr      — correlation_analysis output for overlap features
+            nooverlap_corr    — correlation_analysis output (already computed, passed in)
+            comparison_df     — side-by-side Spearman r for overlap vs non-overlap
+    """
+    # --- Check A: beta-adjusted CAR regression ---
+    market_result = regression_analysis(
+        df, target_car="CAR_3d",
+        sentiment_features=REDUCED_FEATURES, control_vars=[],
+    )
+    beta_result = regression_analysis(
+        df, target_car="beta_CAR_3d",
+        sentiment_features=REDUCED_FEATURES, control_vars=[],
+    )
+
+    # --- Check B: overlap chunking correlation ---
+    overlap_path = config.CACHE_DIR / "finbert_scores_overlap.parquet"
+    if not overlap_path.exists():
+        logger.warning("robustness_checks: overlap cache not found at %s", overlap_path)
+        overlap_corr = None
+        comparison_df = None
+    else:
+        from features import build_feature_matrix
+        overlap_scores = pd.read_parquet(overlap_path)
+        overlap_features = build_feature_matrix(overlap_scores)
+
+        # Merge with CAR data for correlation analysis
+        car_cols = ["ticker", "date"] + CAR_COLUMNS
+        overlap_with_car = overlap_features.merge(
+            df[car_cols], on=["ticker", "date"], how="inner",
+        )
+        overlap_corr = correlation_analysis(
+            overlap_with_car, SENTIMENT_FEATURES, CAR_COLUMNS,
+        )
+
+        # Correlation results for non-overlap (already in df)
+        nooverlap_corr = correlation_analysis(df, SENTIMENT_FEATURES, CAR_COLUMNS)
+
+        # Side-by-side comparison for CAR_3d, primary features
+        oo = overlap_corr[overlap_corr["car_window"] == "CAR_3d"][["feature", "spearman_r"]].rename(
+            columns={"spearman_r": "overlap_spearman_r"}
+        )
+        no = nooverlap_corr[nooverlap_corr["car_window"] == "CAR_3d"][["feature", "spearman_r"]].rename(
+            columns={"spearman_r": "nooverlap_spearman_r"}
+        )
+        comparison_df = oo.merge(no, on="feature").sort_values(
+            "nooverlap_spearman_r", key=abs, ascending=False
+        ).reset_index(drop=True)
+        comparison_df["diff"] = (
+            comparison_df["overlap_spearman_r"] - comparison_df["nooverlap_spearman_r"]
+        ).round(6)
+
+    return {
+        "beta_car_result": beta_result,
+        "market_car_result": market_result,
+        "overlap_corr": overlap_corr,
+        "comparison_df": comparison_df,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Out-of-sample test
+# ---------------------------------------------------------------------------
+
+def out_of_sample_test(
+    df: pd.DataFrame,
+    train_end_year: int,
+    feature: str,
+    car_column: str,
+    n_quantiles: int = 4,
+) -> dict:
+    """Apply in-sample quantile thresholds to out-of-sample data.
+
+    Quantile boundaries are computed on the training period only and then
+    applied to the test period. This is a stricter test than in-sample
+    quantile analysis: the thresholds cannot adapt to the test distribution.
+
+    Args:
+        df: analysis_ready DataFrame.
+        train_end_year: last year (inclusive) of the training period.
+            Test period is train_end_year + 1 onward.
+        feature: sentiment feature to sort by.
+        car_column: CAR outcome column.
+        n_quantiles: number of equal-sized groups (default 4).
+
+    Returns:
+        dict with keys:
+            train_summary   — quantile_analysis summary_df on training data
+            train_spread    — spread dict on training data
+            test_summary    — quantile summary_df on test data (using train thresholds)
+            test_spread     — spread dict on test data
+            thresholds      — quantile boundary values from training period
+            train_end_year  — the split year used
+            n_train         — complete training observations
+            n_test          — complete test observations
+    """
+    work = df.copy()
+    if "year" not in work.columns:
+        work["year"] = work["date"].dt.year
+
+    sub = work[[feature, car_column, "year"]].dropna()
+    train = sub[sub["year"] <= train_end_year]
+    test = sub[sub["year"] > train_end_year]
+
+    if len(train) < 100:
+        raise ValueError(f"Training set too small: {len(train)} rows")
+    if len(test) < 50:
+        raise ValueError(f"Test set too small: {len(test)} rows")
+
+    # Compute quantile thresholds from training data
+    thresholds = train[feature].quantile(
+        [i / n_quantiles for i in range(1, n_quantiles)]
+    ).values
+
+    # In-sample quantile results (for reference)
+    train_summary, train_spread = quantile_analysis(
+        train.drop(columns="year"), feature, car_column, n_quantiles,
+    )
+
+    # Apply training thresholds to test data
+    test = test.copy()
+    test["quantile"] = np.searchsorted(thresholds, test[feature].values) + 1
+    test["quantile"] = test["quantile"].clip(1, n_quantiles)
+
+    test_records = []
+    for q in range(1, n_quantiles + 1):
+        grp = test.loc[test["quantile"] == q, car_column]
+        feat_grp = test.loc[test["quantile"] == q, feature]
+        label = (
+            "Q1 (bottom)" if q == 1
+            else f"Q{n_quantiles} (top)" if q == n_quantiles
+            else f"Q{q}"
+        )
+        test_records.append({
+            "quantile": q,
+            "label": label,
+            "n": len(grp),
+            "mean_car": round(grp.mean(), 6) if len(grp) else np.nan,
+            "median_car": round(grp.median(), 6) if len(grp) else np.nan,
+            "std_car": round(grp.std(), 6) if len(grp) else np.nan,
+            "feature_mean": round(feat_grp.mean(), 6) if len(feat_grp) else np.nan,
+        })
+    test_summary = pd.DataFrame(test_records)
+
+    q1_test = test.loc[test["quantile"] == 1, car_column].values
+    qn_test = test.loc[test["quantile"] == n_quantiles, car_column].values
+    t_stat, p_val = stats.ttest_ind(qn_test, q1_test, equal_var=False)
+
+    test_spread = {
+        "q4_mean": round(float(qn_test.mean()), 6),
+        "q1_mean": round(float(q1_test.mean()), 6),
+        "spread": round(float(qn_test.mean() - q1_test.mean()), 6),
+        "t_stat": round(t_stat, 4),
+        "p_value": round(p_val, 6),
+        "is_significant": bool(p_val < 0.05),
+        "n_q4": len(qn_test),
+        "n_q1": len(q1_test),
+    }
+
+    logger.info(
+        "out_of_sample_test: train≤%d (n=%d), test>%d (n=%d), "
+        "in-sample spread=%.4f, out-of-sample spread=%.4f",
+        train_end_year, len(train), train_end_year, len(test),
+        train_spread["spread"], test_spread["spread"],
+    )
+    return {
+        "train_summary": train_summary,
+        "train_spread": train_spread,
+        "test_summary": test_summary,
+        "test_spread": test_spread,
+        "thresholds": thresholds,
+        "train_end_year": train_end_year,
+        "n_train": len(train),
+        "n_test": len(test),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main — runs full pipeline and prints results at each stop point
 # ---------------------------------------------------------------------------
 
@@ -563,3 +971,150 @@ if __name__ == "__main__":
     print(f"\nSummary:")
     print(f"  Correlation tests: {n_corr_survive}/{len(corr_bonf)} survive Bonferroni")
     print(f"  Regression tests:  {n_reg_survive}/{len(reg_bonf)} survive Bonferroni")
+
+    # ------------------------------------------------------------------
+    # STEP 5: Quantile analysis — sentiment_delta → CAR_3d
+    # ------------------------------------------------------------------
+    if "--step5" not in sys.argv:
+        sys.exit(0)
+
+    print("\n" + "="*70)
+    print("STEP 5: QUANTILE ANALYSIS — sentiment_delta → CAR_3d")
+    print("="*70)
+
+    q_summary, q_spread = quantile_analysis(df, "sentiment_delta", "CAR_3d")
+
+    print("\nQuantile summary (feature = sentiment_delta, outcome = CAR_3d):\n")
+    print(q_summary.to_string(index=False))
+    print(f"\nQ4-Q1 spread: {q_spread['spread']:+.4f}")
+    print(f"Q4 mean CAR:  {q_spread['q4_mean']:+.4f}  (n={q_spread['n_q4']:,})")
+    print(f"Q1 mean CAR:  {q_spread['q1_mean']:+.4f}  (n={q_spread['n_q1']:,})")
+    print(f"Welch t-test: t={q_spread['t_stat']:.4f}, p={q_spread['p_value']:.6f}, "
+          f"significant={q_spread['is_significant']}")
+
+    print("\n" + "="*70)
+    print("STOP 5: Review quantile table — check monotonicity.")
+    print("Run with --step6 to continue to period breakdown.")
+    print("="*70)
+
+    if "--step6" not in sys.argv:
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # STEP 6: Quantile spread by year (alpha decay test)
+    # ------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("STEP 6: SPREAD BY YEAR — sentiment_delta → CAR_3d (alpha decay test)")
+    print("="*70)
+
+    df["year"] = df["date"].dt.year
+    period_df = quantile_by_period(df, "sentiment_delta", "CAR_3d")
+
+    print("\nQ4-Q1 spread by year:\n")
+    print(period_df.to_string(index=False))
+
+    print("\n" + "="*70)
+    print("STOP 6: Review annual spread — any evidence of decay in recent years?")
+    print("Run with --step7 to continue to sector breakdown.")
+    print("="*70)
+
+    if "--step7" not in sys.argv:
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # STEP 7: Quantile spread by sector
+    # ------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("STEP 7: SPREAD BY SECTOR — sentiment_delta → CAR_3d")
+    print("="*70)
+
+    sector_df = quantile_by_sector(df, "sentiment_delta", "CAR_3d")
+
+    print("\nQ4-Q1 spread by sector (sorted by spread descending):\n")
+    print(sector_df.to_string(index=False))
+
+    print("\n" + "="*70)
+    print("STOP 7: Review sector breakdown.")
+    print("Run with --step8 to continue to robustness checks.")
+    print("="*70)
+
+    if "--step8" not in sys.argv:
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # STEP 8: Robustness checks
+    # ------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("STEP 8: ROBUSTNESS CHECKS")
+    print("="*70)
+
+    robust = robustness_checks(df)
+
+    print("\n--- Check A: Market-adjusted vs Beta-adjusted CAR_3d (reduced model) ---\n")
+    mkt = robust["market_car_result"]["summary_df"]
+    beta = robust["beta_car_result"]["summary_df"]
+
+    compare_coef = pd.DataFrame({
+        "feature": REDUCED_FEATURES,
+        "market_coef": [mkt.loc[f, "coef"] if f in mkt.index else np.nan for f in REDUCED_FEATURES],
+        "market_p":    [mkt.loc[f, "p_value"] if f in mkt.index else np.nan for f in REDUCED_FEATURES],
+        "beta_coef":   [beta.loc[f, "coef"] if f in beta.index else np.nan for f in REDUCED_FEATURES],
+        "beta_p":      [beta.loc[f, "p_value"] if f in beta.index else np.nan for f in REDUCED_FEATURES],
+    })
+    print(compare_coef.to_string(index=False))
+    print(f"\nMarket-adj R²={robust['market_car_result']['r_squared']:.4f} (n={robust['market_car_result']['n_obs']:,})")
+    print(f"Beta-adj    R²={robust['beta_car_result']['r_squared']:.4f} (n={robust['beta_car_result']['n_obs']:,})")
+
+    if robust["comparison_df"] is not None:
+        print("\n--- Check B: Overlap vs Non-overlap chunking (Spearman r, CAR_3d) ---\n")
+        print(robust["comparison_df"].to_string(index=False))
+    else:
+        print("\n--- Check B: Overlap cache not found — skipped ---")
+
+    print("\n" + "="*70)
+    print("STOP 8: Review robustness checks.")
+    print("Run with --step9 --train-end YEAR to run out-of-sample test.")
+    print("="*70)
+
+    if "--step9" not in sys.argv:
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # STEP 9: Out-of-sample test
+    # ------------------------------------------------------------------
+    import argparse
+    parser = argparse.ArgumentParser()
+    for flag in ["--step2","--step3","--step4","--step5","--step6",
+                 "--step7","--step8","--step9"]:
+        parser.add_argument(flag, action="store_true")
+    parser.add_argument("--train-end", type=int, default=None)
+    args = parser.parse_args()
+
+    if args.train_end is None:
+        print("\n" + "="*70)
+        print("STOP 9: --train-end YEAR required.")
+        print("Example: --step9 --train-end 2021")
+        print("="*70)
+        sys.exit(0)
+
+    print("\n" + "="*70)
+    print(f"STEP 9: OUT-OF-SAMPLE TEST — train ≤ {args.train_end}, test > {args.train_end}")
+    print("Feature: sentiment_delta → CAR_3d")
+    print("="*70)
+
+    oos = out_of_sample_test(df, args.train_end, "sentiment_delta", "CAR_3d")
+
+    print(f"\nTraining period: ≤ {oos['train_end_year']}  (n={oos['n_train']:,} complete events)")
+    print(f"Test period:     > {oos['train_end_year']}  (n={oos['n_test']:,} complete events)")
+    print(f"\nQuantile thresholds from training data: {[round(t, 4) for t in oos['thresholds']]}")
+
+    print("\nIn-sample quantile summary:")
+    print(oos["train_summary"].to_string(index=False))
+    print(f"  In-sample spread:  {oos['train_spread']['spread']:+.4f}  "
+          f"p={oos['train_spread']['p_value']:.4f}")
+
+    print("\nOut-of-sample quantile summary (training thresholds applied):")
+    print(oos["test_summary"].to_string(index=False))
+    print(f"  Out-of-sample spread: {oos['test_spread']['spread']:+.4f}  "
+          f"p={oos['test_spread']['p_value']:.4f}  "
+          f"significant={oos['test_spread']['is_significant']}")

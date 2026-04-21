@@ -111,6 +111,50 @@ The full-sample model is the primary specification. The controlled model is a ro
 
 `earnings_surprise` (analyst consensus beat/miss) is not in the dataset and is omitted. This is an intentional scope decision: the hypothesis under test is whether *how management talks* predicts returns, not whether reported numbers beat expectations. The two signals are correlated in practice — a positive sentiment delta may partly reflect a genuine beat before it is fully priced in — but that is a plausible economic channel rather than a confound to eliminate.
 
+## Signal testing findings
+
+### Quantile analysis
+
+Sorting earnings events into quartiles by `sentiment_delta` (quarter-over-quarter tone change) produces a monotonic CAR_3d pattern with no inversions:
+
+| Quartile | Mean sentiment delta | Mean 3-day CAR |
+|---|---|---|
+| Q1 (most negative tone shift) | -0.093 | -1.66% |
+| Q2 | -0.019 | +0.13% |
+| Q3 | +0.025 | +0.66% |
+| Q4 (most positive tone shift) | +0.100 | +1.60% |
+
+**Q4-Q1 spread: +3.3 percentage points** (Welch t=12.87, p<0.001, n=11,810 events).
+
+### Alpha decay
+
+The Q4-Q1 spread by year shows no evidence of monotonic decay:
+
+| Year | Spread | Significant |
+|---|---|---|
+| 2019 | +4.93% | Yes |
+| 2020 | +3.48% | Yes |
+| 2021 | +2.50% | Yes |
+| 2022 | +4.10% | Yes |
+| 2023 | +6.43% | No (n=80, partial year) |
+
+2017–2018 are excluded: `sentiment_delta` requires a prior-quarter call, so 2017 has zero valid observations and 2018 fewer than 50. The 2021 dip (lowest spread at +2.5%) coincides with the meme-stock / COVID-recovery regime — anomalous market conditions rather than structural decay. The signal recovers fully in 2022.
+
+### Sector breakdown
+
+The signal is concentrated in sectors where management language carries forward-looking information the market hasn't fully priced. It is weak or absent in sectors where returns are driven by macro factors outside management's control:
+
+**Signal present** (spread significant at p < 0.05): Healthcare (+4.96%), Consumer Defensive (+3.69%), Industrials (+3.65%), Technology (+3.44%), Consumer Cyclical (+2.27%).
+
+**Signal absent**: Communication Services, Basic Materials, Financial Services, Real Estate, Utilities, Energy.
+
+The pattern is economically coherent:
+- **Utilities**: Regulated, bond-proxy behaviour. Stock prices respond to rate expectations and dividend yield, not management tone. Low CAR dispersion in both tails compresses the measurable spread.
+- **Energy**: Commodity-price driven. The macro oil/gas signal overwhelms any tone information — Q4 and Q1 mean CARs are nearly identical (-0.003 vs -0.003).
+- **Basic Materials**: Same commodity-cycle logic as Energy.
+- **Communication Services**: A mixed sector spanning regulated legacy telecom (Utilities-like) and growth streaming/social (Tech-like); the two sub-groups likely offset each other.
+- **Financial Services**: Heavily compliance-constrained language reduces FinBERT's discriminating power; investors focus on loan book quality, NIM, and capital ratios rather than tone.
+
 ## FinBERT inference
 
 Model: [ProsusAI/finbert](https://huggingface.co/ProsusAI/finbert) via HuggingFace Transformers. Three output probabilities per chunk: `positive_prob`, `negative_prob`, `neutral_prob` (sum to 1.0).
