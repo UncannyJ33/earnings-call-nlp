@@ -1,150 +1,125 @@
-# Earnings Call NLP
+# Earnings Call NLP → Alpha Signal Testing
 
-Sentiment analysis of earnings call transcripts using FinBERT, covering 18,755 calls across 2,876 tickers from 2017–2023 (Motley Fool dataset).
+Extracting sentiment from earnings call transcripts using FinBERT and testing whether tone shifts predict post-earnings stock returns.
 
-![Quantile staircase](figures/signal_quantile_staircase.png)
-*Events sorted by quarter-over-quarter sentiment shift. Q4−Q1 spread: +3.3pp (t=12.87, p<0.001, n=11,810).*
+---
 
-## Pipeline overview
+## The Question
 
-```
-Raw transcripts (.pkl)
-        │
-        ▼
-  data_ingestion.py   — load, validate, standardize columns
-        │
-        ▼
-  preprocessing.py    — parse sections → tag speakers → chunk
-        │              (produces non-overlap + overlap chunks per transcript)
-        ▼
-  sentiment.py        — FinBERT inference → parquet cache
-        │
-        ▼
-  signal testing      — compare chunking strategies, build return signals
-```
+The efficient market hypothesis says public information shouldn't predict returns — by the time a quarterly earnings call ends, any signal in management language should already be priced in. But there are reasons to expect a gap.
 
-## Notebooks
+Earnings calls are unstructured. Analysts and algorithms are optimized to process numbers — EPS beats, revenue guidance, margin expansion. Language is harder. A CFO can report in-line numbers while conveying stress through hedged phrasing, increased negative language, or a noticeably defensive Q&A session. The behavioral finance literature suggests that markets incorporate qualitative signals more slowly than quantitative ones, particularly for smaller or less-covered companies where fewer analysts are listening for subtle tone shifts.
 
-| Notebook | Description |
-|---|---|
-| [01_eda.ipynb](notebooks/01_eda.ipynb) | Dataset overview, transcript length, section and speaker distributions |
-| [02_sentiment_analysis.ipynb](notebooks/02_sentiment_analysis.ipynb) | FinBERT score distributions, sentiment by section/role/time, overlap vs non-overlap |
-| [03_signal_testing.ipynb](notebooks/03_signal_testing.ipynb) | Correlation analysis, regression, quantile staircase, sector breakdown, OOS validation |
-| [04_results_summary.ipynb](notebooks/04_results_summary.ipynb) | Executive summary, key charts, limitations |
+This project tests that idea empirically: does a quarter-over-quarter change in management tone — as measured by FinBERT sentiment scoring — predict abnormal stock returns in the 1, 3, or 5 trading days following the call? The answer is: yes, weakly, in a subset of sectors. The rest of this document explains what was tested, what the results show, and where the analysis falls short.
 
-## Dataset
+---
 
-- **Source**: [Motley Fool Scraped Earnings Call Transcripts](https://www.kaggle.com/datasets/tpotterer/motley-fool-scraped-earnings-call-transcripts) (Kaggle)
-- **Scale**: 18,755 transcripts, 2,876 unique tickers, 2017–2023
-- **Format**: pickle file containing a DataFrame with columns: `ticker`, `date`, `exchange`, `q` (fiscal quarter), `transcript`
-- **Coverage**: ~54% of transcripts have an explicit Q&A section; the remaining ~46% are parsed using a heuristic analyst speaker boundary
+## Data & Methodology
 
-## Setup
+### Dataset
 
-```bash
-brew install python@3.12
-python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
+The [Motley Fool Scraped Earnings Call Transcripts](https://www.kaggle.com/datasets/tpotterer/motley-fool-scraped-earnings-call-transcripts) dataset from Kaggle contains 18,755 earnings call transcripts across 2,876 unique tickers, spanning 2017–2023. Each record includes the ticker, date, exchange, fiscal quarter, and the full transcript text. Post-earnings stock returns were computed using price data from yfinance; 20.1% of events (3,526 of 17,542) were excluded due to missing price data — primarily delisted, acquired, or renamed companies — which introduces survivorship bias toward larger firms.
 
-Download the dataset (requires Kaggle API credentials in `~/.kaggle/kaggle.json`):
+### FinBERT Sentiment Scoring
 
-```bash
-.venv/bin/kaggle datasets download \
-  -d tpotterer/motley-fool-scraped-earnings-call-transcripts \
-  -p data/raw --unzip
-```
+[ProsusAI/finbert](https://huggingface.co/ProsusAI/finbert) (via HuggingFace Transformers) was used to score transcript sentiment. FinBERT outputs three probabilities per input — `positive_prob`, `negative_prob`, `neutral_prob` — that sum to 1.0. The score used throughout is **net sentiment**: `positive_prob − negative_prob`.
 
-## Preprocessing
+FinBERT has a hard 512-token limit. A typical earnings call transcript runs 8,000+ words (~10,000 tokens), so transcripts must be split into chunks before scoring.
 
-`src/preprocessing.py` transforms raw transcript text into per-chunk DataFrames ready for inference. Each transcript goes through four stages:
+### Chunking Strategy
 
-### 1. Section parsing
+Two strategies were implemented and compared:
 
-Transcripts are split into `prepared_remarks` and `qa_session`. Three detection strategies are applied in order:
+**Speaker-turn chunking (primary)**: Each speaker turn in the transcript is treated as a separate chunk. Long turns are split at sentence boundaries to stay under 512 tokens. This preserves speaker attribution — CEO prepared remarks, CFO financial commentary, and analyst questions are scored independently. The result is 15–25 chunks per transcript for a typical call.
 
-1. Explicit `"Questions and Answers:"` header line (~54% of transcripts)
-2. Fallback: first analyst speaker line (`"Name -- Firm -- Analyst"`) after a minimum number of prepared-remarks lines (~46% of transcripts)
-3. No Q&A found: entire body goes to `prepared_remarks`
+**Overlap chunking (comparison)**: All speaker turns within each section (prepared remarks, Q&A) are concatenated into a single text, then chunked using a 50%-stride sliding window. Every sentence appears in at least two chunks, which theoretically captures sentiment that falls at a non-overlap chunk boundary.
 
-### 2. Text cleaning
+**Finding**: At the transcript level, the two strategies produce nearly identical signal. Spearman correlations between `sentiment_delta` and `CAR_3d` differed by less than 0.003 across all tested windows. This is expected: chunk boundary effects wash out when aggregating 15–25 chunk scores to a single transcript-level mean. The speaker-turn strategy was retained as primary because it preserves attribution and is more interpretable.
 
-Boilerplate is stripped: operator procedural phrases, legal safe-harbour sentences, recording/replay notices. Speaker attribution lines and financial content are preserved.
+### Aggregation Strategies
 
-### 3. Speaker tagging
+Multiple aggregation statistics were computed per transcript:
 
-Speaker turns are identified by `"Name -- Title"` or `"Name -- Firm -- Analyst"` lines. Each speaker is assigned a coarse role label: `ceo`, `cfo`, `executive`, `ir`, `analyst`, or `operator`.
+- **Mean** (`net_sentiment`): overall tone across all chunks — the level signal
+- **Standard deviation** (`sentiment_variance`): spread of chunk scores within a call — captures inconsistency and hedging
+- **Max positive** (`max_positive`): the most optimistic single chunk — peak tone
+- **Min positive** (`min_positive`): the least optimistic chunk — the worst moment in the call
 
-### 4. Chunking — two strategies
+Each captures a different aspect of the transcript. Mean is the workhorse for return prediction; variance was tested as a potential hedge/uncertainty proxy.
 
-This is the key design decision. FinBERT has a hard 512-token limit, so transcripts must be split into chunks. Two strategies are produced for every transcript:
+### Return Calculation: Cumulative Abnormal Return (CAR)
 
-**Non-overlap (speaker-turn chunking)**
-Each chunk corresponds to one speaker turn. Long turns are split at sentence boundaries to stay under 512 tokens. Chunks are independent and speaker-attributed — a CEO's prepared remarks are a separate chunk from the CFO's, and separate from analyst questions. This is the natural unit of earnings call discourse.
+Post-earnings stock performance is measured as **Cumulative Abnormal Return (CAR)**: the stock's daily return minus the S&P 500 (SPY) return, summed over 1, 3, and 5 trading days following the call.
 
-**Overlap (50%-stride sliding windows)**
-All speaker turns within a section are concatenated into a single text, then chunked using a sliding window with 50% stride. Each chunk overlaps by half with the previous one. Speaker attribution is lost (chunks are labelled `"mixed"`), but sentiment that falls at a non-overlap chunk boundary is captured.
+**Earnings window timing**: Getting the start of the return window right matters. Calls before 4:00 p.m. ET (morning or midday) use the earnings date itself as day 1 — the market is open and reacts immediately. Calls at or after 4:00 p.m. ET use the next trading day — the market is closed when the call happens, so the earliest reaction is the following morning. Call times are extracted directly from the dataset timestamps.
 
-**Why both?** Sentiment in financial text is often expressed across sentence and turn boundaries. A CFO might hedge a strong statement in the following sentence, or a CEO might qualify remarks made earlier in the same section. The non-overlap strategy can split these in half — one chunk gets the positive signal, the next gets the hedge — and the sentiment averages out. The overlap strategy mitigates this by ensuring that every sentence appears in at least two chunks. Both strategies are scored and compared during signal testing to determine which produces more predictive sentiment signals. The overlap chunk count is typically ~70% of the non-overlap count (not double, because the 50% stride advances by half a window at a time and many turns are short enough to fit in a single chunk under either strategy).
+**Why 1, 3, and 5 days?** The 1-day window captures the immediate market reaction. The 3-day window is the standard post-earnings drift window used in academic literature. The 5-day window tests whether any signal persists into the following week — drift or reversal.
 
-## Return calculation (CAR)
+**Robustness**: Beta-adjusted CAR was computed as a robustness check. Each stock's beta is estimated on the 120 trading days prior to the earnings event (non-overlapping with the CAR window). Regression coefficients were essentially unchanged between market-adjusted and beta-adjusted specifications, suggesting the results are not driven by systematic risk mismeasurement.
 
-Post-earnings stock performance is measured as **Cumulative Abnormal Return (CAR)** — the stock's return minus the S&P 500 (SPY) return over 1, 3, and 5 trading days following the call.
+---
 
-### Earnings window timing
+## Key Features (Analytical Differentiators)
 
-Getting the start of the return window right matters. The rule used here:
+**Quarter-over-quarter sentiment delta** (`sentiment_delta`): The change in net sentiment from the prior earnings call to the current one, for the same company. This is the primary signal. Raw sentiment level carries substantial company-fixed effects — optimistic management teams are always positive, pessimistic ones are always negative. The delta removes that baseline and asks: *did tone improve or worsen this quarter?* A company that shifts from −0.1 to +0.1 is likely communicating something the prior quarter did not.
 
-- **Call before 4:00 p.m. ET** (morning or midday) → window starts on the earnings date itself. The market is open and reacts immediately; using the same calendar day captures the full reaction and avoids losing a day of signal.
-- **Call at or after 4:00 p.m. ET** (after market close) → window starts the *next* trading day. The market is closed when the call happens, so the earliest possible reaction is the following morning. Using the earnings date here would capture pre-call returns — noise, not signal.
-- **Time unknown** → next trading day (conservative fallback).
+**Prepared remarks vs. Q&A divergence** (`qa_divergence`): Prepared remarks are scripted and optimized for message control. The Q&A session is live — analysts ask pointed questions and management must respond in real time. A large negative divergence (Q&A much more negative than prepared remarks) suggests that management's carefully constructed narrative isn't holding up under questioning. This is a proxy for management defensiveness.
 
-Call times are extracted directly from the raw dataset timestamps (e.g. "Aug 27, 2020, 9:00 p.m. ET"). This is preferable to defaulting all events to next-day, because morning calls — which make up a meaningful portion of the dataset — lose a full day of reaction time under a conservative blanket rule, compressing the measurable signal.
+**Multi-speaker analysis**: CEO sentiment, CFO sentiment, and analyst tone are scored separately. Management optimism from a CEO is different from the same language from a CFO (whose domain is financial controls and risk). Analyst tone during Q&A captures the sell-side's collective sentiment about the call in real time.
 
-### Sample coverage and survivorship bias
+**Sector-level decomposition**: The signal is tested separately for each sector. In sectors where stock prices are driven by macro factors outside management's control (energy, utilities, basic materials), tone is unlikely to add information. In sectors where forward guidance and operational execution drive returns (technology, healthcare, industrials), tone is more likely to carry independent signal.
 
-20.1% of earnings events (3,526 of 17,542) are excluded from the return analysis due to missing price data — yfinance cannot find historical prices for tickers that have since been delisted, acquired, renamed, or taken private. These 670 missing tickers are disproportionately **small-cap companies**: the excluded events have a median market cap of $1.1B vs $5.0B for the retained sample. Healthcare (likely small-cap biotech/pharma) and Communication Services are overrepresented among the missing.
+**Statistical rigor**: All correlations are reported with Bonferroni-corrected p-values (21 tests across 7 features × 3 windows). Regressions use HC3 heteroskedasticity-robust standard errors. Multicollinearity was detected and addressed: the full 7-feature model had VIFs of 56–91 for several features, so a reduced 3-feature model (`sentiment_delta`, `qa_divergence`, `analyst_tone`) was used for regression, retaining only features with distinct constructs. An out-of-sample test was run by training on events through 2021 and testing on 2022–2023.
 
-This introduces survivorship bias. The analysis sample skews toward larger, more established companies that continued trading through 2017–2023. Companies that failed or underwent distressed M&A are largely absent. Signal findings are more applicable to mid- and large-cap equities — extrapolating to small-cap or speculative names should be done with caution.
+---
 
-### Benchmark and adjustment methods
+## Results
 
-- **Primary**: market-adjusted CAR — stock return minus SPY return each day, summed over the window
-- **Robustness check**: beta-adjusted CAR — expected return is beta × SPY return, where beta is estimated on the 120 trading days prior to the event (non-overlapping with the CAR window)
+### Correlations
 
-### Regression model specification
+All seven sentiment features show statistically significant Spearman correlations with all three CAR windows (all p < 0.001 after Bonferroni correction, n = 11,000–14,000 events). The magnitudes are modest:
 
-Two model variants are reported for each CAR window:
+| Feature | CAR_1d | CAR_3d | CAR_5d |
+|---|---|---|---|
+| Sentiment Delta (QoQ) | 0.128 | **0.133** | 0.125 |
+| Net Sentiment | 0.117 | 0.107 | 0.093 |
+| Analyst Tone | 0.111 | 0.103 | 0.091 |
+| Q&A Divergence | −0.080 | −0.065 | −0.055 |
 
-- **Full-sample model** (~14,000 events): sentiment features only, no size control. Uses every event with available price data.
-- **Controlled model** (~8,200 events): adds `log(market_cap)` and sector fixed effects as controls. Restricted to tickers for which yfinance returned a market cap — a non-random subsample that skews mid- to large-cap (median $5.0B vs $1.1B for the excluded names).
+`sentiment_delta` consistently produces the strongest signal. Correlations decay slightly moving from 3-day to 5-day windows, suggesting the market incorporates tone information within a few days rather than drifting over the full week.
 
-The full-sample model is the primary specification. The controlled model is a robustness check: if sentiment coefficients are stable across both, the signal is not simply a proxy for size or sector effects. The ~5,800 event gap between the two samples is itself a finding — the analysis cannot be extended to the small-cap universe without a separate market-cap data source.
+### Quantile Analysis
 
-`earnings_surprise` (analyst consensus beat/miss) is not in the dataset and is omitted. This is an intentional scope decision: the hypothesis under test is whether *how management talks* predicts returns, not whether reported numbers beat expectations. The two signals are correlated in practice — a positive sentiment delta may partly reflect a genuine beat before it is fully priced in — but that is a plausible economic channel rather than a confound to eliminate.
-
-## Signal testing findings
-
-### Quantile analysis
-
-Sorting earnings events into quartiles by `sentiment_delta` (quarter-over-quarter tone change) produces a monotonic CAR_3d pattern with no inversions:
+Events sorted into quartiles by `sentiment_delta` show a clean monotonic pattern across all four quartiles with no inversions — the staircase pattern that indicates a genuine ordinal relationship rather than a noise artifact driven by extreme observations:
 
 | Quartile | Mean sentiment delta | Mean 3-day CAR |
 |---|---|---|
-| Q1 (most negative tone shift) | -0.093 | -1.66% |
-| Q2 | -0.019 | +0.13% |
+| Q1 (most negative tone shift) | −0.093 | −1.66% |
+| Q2 | −0.019 | +0.13% |
 | Q3 | +0.025 | +0.66% |
 | Q4 (most positive tone shift) | +0.100 | +1.60% |
 
-**Q4-Q1 spread: +3.3 percentage points** (Welch t=12.87, p<0.001, n=11,810 events).
+**Q4−Q1 spread: +3.3 percentage points** (Welch t = 12.87, p < 0.001, n = 11,810).
 
 ![Quantile staircase](figures/signal_quantile_staircase.png)
 
-### Alpha decay
+### Sector Breakdown
 
-The Q4-Q1 spread by year shows no evidence of monotonic decay:
+The signal is concentrated in sectors where management language carries forward-looking information:
 
-| Year | Spread | Significant |
+**Signal present** (spread significant at p < 0.05): Healthcare (+4.96%), Consumer Defensive (+3.69%), Industrials (+3.65%), Technology (+3.44%), Consumer Cyclical (+2.27%).
+
+**Signal absent**: Energy, Utilities, Basic Materials, Financial Services, Real Estate, and Communication Services (a mixed sector spanning regulated legacy telecom and growth streaming/social whose two sub-groups likely offset each other).
+
+The absence pattern is economically coherent. Energy and commodity stocks move with oil prices, not management tone. Utilities are rate-sensitive bond proxies where sentiment is largely irrelevant to valuation. Financial Services firms face compliance-constrained language that reduces FinBERT's discriminating power.
+
+![Sector breakdown](figures/signal_sector_heatmap.png)
+
+### Alpha Decay
+
+The Q4−Q1 spread by year shows no evidence of monotonic decay:
+
+| Year | Q4−Q1 spread | Significant |
 |---|---|---|
 | 2019 | +4.93% | Yes |
 | 2020 | +3.48% | Yes |
@@ -152,67 +127,118 @@ The Q4-Q1 spread by year shows no evidence of monotonic decay:
 | 2022 | +4.10% | Yes |
 | 2023 | +6.43% | No (n=80, partial year) |
 
-2017–2018 are excluded: `sentiment_delta` requires a prior-quarter call, so 2017 has zero valid observations and 2018 fewer than 50. The 2021 dip (lowest spread at +2.5%) coincides with the meme-stock / COVID-recovery regime — anomalous market conditions rather than structural decay. The signal recovers fully in 2022.
+The 2021 dip (lowest spread, +2.5%) coincides with the meme-stock and COVID-recovery regime — anomalous market conditions rather than structural signal decay. The signal recovers fully in 2022. 2017–2018 are excluded because `sentiment_delta` requires a prior-quarter call, leaving too few valid observations in those early years.
 
 ![Alpha decay](figures/signal_alpha_decay.png)
 
-### Sector breakdown
+### Out-of-Sample Validation
 
-The signal is concentrated in sectors where management language carries forward-looking information the market hasn't fully priced. It is weak or absent in sectors where returns are driven by macro factors outside management's control:
+Quantile thresholds were fixed using events through 2021 (training period) and applied without modification to 2022–2023 events (holdout). The Q4−Q1 spread in the holdout period is directionally consistent with the in-sample result, though narrower and with higher variance given the smaller holdout sample (~1,200 events). The signal does not appear to be a pure backtest artifact.
 
-**Signal present** (spread significant at p < 0.05): Healthcare (+4.96%), Consumer Defensive (+3.69%), Industrials (+3.65%), Technology (+3.44%), Consumer Cyclical (+2.27%).
+---
 
-**Signal absent**: Communication Services, Basic Materials, Financial Services, Real Estate, Utilities, Energy.
+## Honest Caveats
 
-The pattern is economically coherent:
-- **Utilities**: Regulated, bond-proxy behaviour. Stock prices respond to rate expectations and dividend yield, not management tone. Low CAR dispersion in both tails compresses the measurable spread.
-- **Energy**: Commodity-price driven. The macro oil/gas signal overwhelms any tone information — Q4 and Q1 mean CARs are nearly identical (-0.003 vs -0.003).
-- **Basic Materials**: Same commodity-cycle logic as Energy.
-- **Communication Services**: A mixed sector spanning regulated legacy telecom (Utilities-like) and growth streaming/social (Tech-like); the two sub-groups likely offset each other.
-- **Financial Services**: Heavily compliance-constrained language reduces FinBERT's discriminating power; investors focus on loan book quality, NIM, and capital ratios rather than tone.
+**Post-earnings drift is regime-dependent.** The signal magnitude varies meaningfully by year. A strategy built on this signal would need to survive periods like 2021 where the spread compresses significantly.
 
-![Sector breakdown](figures/signal_sector_heatmap.png)
+**This is not a trading strategy.** The quantile spread of +3.3pp is a gross signal before transaction costs, market impact, or slippage. Real-world transaction costs for small-cap names (which dominate the dataset's long tail) would likely consume most or all of this spread.
 
-## FinBERT inference
+**Survivorship bias.** 20.1% of events are missing price data, disproportionately from small-cap and eventually-delisted companies (median market cap $1.1B vs. $5.0B for the retained sample). The analysis overrepresents companies that survived 2017–2023.
 
-Model: [ProsusAI/finbert](https://huggingface.co/ProsusAI/finbert) via HuggingFace Transformers. Three output probabilities per chunk: `positive_prob`, `negative_prob`, `neutral_prob` (sum to 1.0).
+**FinBERT domain mismatch.** FinBERT was trained on financial news articles and analyst reports, not earnings call transcripts. The model has no exposure to the specific register of earnings calls — operator instructions, safe-harbour language, and scripted Q&A responses. Preprocessing strips boilerplate, but a model fine-tuned on transcript data would likely perform better.
 
-> **This step takes a long time — even on capable hardware.**
->
-> The dataset produces ~2 million chunks across both chunking strategies. On Apple Silicon MPS (Mac Mini), each batch of 1,750 transcripts takes roughly 2.5–3 hours. The full 11-batch run is a **25–30 hour** wall-clock commitment. Plan accordingly: start the run before an overnight or a long away-from-keyboard window. The pipeline is fully resumable — partial results are written after each batch and the next run auto-detects where to continue.
+**No earnings surprise control.** Analyst consensus beat/miss data is not included in the dataset. Sentiment delta may partially proxy for a genuine earnings beat before it is fully priced, rather than capturing incremental information in *how* management talks.
 
-Inference commands:
+**Correlations, not causation.** A Spearman r of 0.133 means tone explains roughly 1.8% of variance in 3-day CAR. The signal is real but small, and its economic mechanism is not definitively identified here.
+
+---
+
+## Deployment Considerations
+
+Running this as a live signal would require:
+
+**Transcript acquisition.** Motley Fool, Seeking Alpha, and S&P Global all offer transcript APIs. Transcripts are typically available within minutes of call completion. Processing latency for FinBERT inference on a single transcript is under 30 seconds on modern hardware.
+
+**Model fine-tuning.** A model fine-tuned on labeled earnings call data would likely improve discriminating power. The FinBERT domain mismatch compresses scores toward neutral relative to a transcript-native model.
+
+**Scale and licensing.** Processing 2,876 tickers quarterly is manageable. At institutional scale (Russell 3000+), transcript licensing costs from S&P or Refinitiv become a meaningful budget item.
+
+**Signal combination.** A Spearman r of 0.13 is too weak to trade in isolation. The realistic application is as a feature in a multi-signal model that also incorporates earnings surprise, guidance revision, and price momentum.
+
+---
+
+## Technical Stack
+
+Python 3.12 · [ProsusAI/finbert](https://huggingface.co/ProsusAI/finbert) via HuggingFace Transformers · PyTorch (MPS acceleration on Apple Silicon) · pandas · numpy · scipy · statsmodels · yfinance · plotly · Streamlit
+
+---
+
+## Project Structure
+
+```
+earnings-call-nlp/
+├── src/
+│   ├── data_ingestion.py   — load and validate raw transcripts
+│   ├── preprocessing.py    — section parsing, speaker tagging, chunking
+│   ├── sentiment.py        — FinBERT batch inference, parquet caching
+│   ├── features.py         — sentiment aggregation and feature engineering
+│   ├── returns.py          — CAR calculation (market- and beta-adjusted)
+│   └── signal_testing.py   — correlation, regression, quantile, OOS tests
+├── notebooks/
+│   ├── 01_eda.ipynb                — dataset overview and distributions
+│   ├── 02_sentiment_analysis.ipynb — FinBERT scores, section/role breakdowns
+│   ├── 03_signal_testing.ipynb     — correlations, regression, quantile analysis
+│   └── 04_results_summary.ipynb   — executive summary and key charts
+├── app/
+│   └── streamlit_app.py    — interactive dashboard
+├── tests/
+│   └── test_returns.py     — pytest suite for CAR calculation logic
+├── figures/                — exported chart PNGs (used in notebooks and README)
+├── config.py               — all paths and parameters
+└── requirements.txt
+```
+
+Data files and FinBERT inference cache are not included in the repository (large files). See **Running the Project** below.
+
+---
+
+## Running the Project
 
 ```bash
-# Run next batch (~1,750 transcripts, auto-resumes from last completed batch)
+# 1. Clone and set up environment
+git clone <repo-url>
+cd earnings-call-nlp
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# 2. Download the dataset (requires Kaggle API credentials in ~/.kaggle/kaggle.json)
+.venv/bin/kaggle datasets download \
+  -d tpotterer/motley-fool-scraped-earnings-call-transcripts \
+  -p data/raw --unzip
+
+# 3. Run FinBERT inference (25–30 hours on Apple Silicon MPS; auto-resumes)
 PYTHONPATH=. .venv/bin/python3.12 src/sentiment.py
-
-# Check progress
-PYTHONPATH=. .venv/bin/python3.12 src/sentiment.py --status
-
-# Force a specific start index
-PYTHONPATH=. .venv/bin/python3.12 src/sentiment.py --start 3500
-
-# After all 11 batches complete, assemble final cache files
+# After all batches complete:
 PYTHONPATH=. .venv/bin/python3.12 src/sentiment.py --merge
+
+# 4. Build features and compute returns
+PYTHONPATH=. .venv/bin/python3.12 src/features.py
+PYTHONPATH=. .venv/bin/python3.12 src/returns.py
+
+# 5. Run notebooks in order (01 → 04) via Jupyter
+.venv/bin/jupyter notebook
+
+# 6. Launch the interactive dashboard
+PYTHONPATH=. .venv/bin/streamlit run app/streamlit_app.py
+
+# 7. Run tests
+PYTHONPATH=. .venv/bin/pytest tests/
 ```
 
-Cache layout (`data/cache/`):
+The FinBERT inference step is the bottleneck — approximately 25–30 hours on Apple Silicon MPS. The pipeline is fully resumable: partial results are written after each batch of ~1,750 transcripts, and subsequent runs auto-detect where to continue.
 
-```
-partials/
-  nooverlap_000000_001750.parquet   ← batch partial files
-  overlap_000000_001750.parquet
-  ...
-finbert_scores_nooverlap.parquet    ← final merged cache (after --merge)
-finbert_scores_overlap.parquet
-finbert_scores_nooverlap.json       ← provenance sidecar
-finbert_scores_overlap.json
-```
+---
 
-### Technical notes
+## Acknowledgments
 
-- **Batch size**: 32 chunks per forward pass — MPS parallelism saturates quickly at FinBERT's sequence lengths; larger batches don't meaningfully increase throughput
-- **Truncation**: chunks estimated at >512 tokens are truncated by the tokenizer; a warning is emitted at inference time. Tightening the chunking limit in preprocessing would eliminate these.
-- **Hardware tested**: Mac Mini (Apple Silicon MPS), ~2.5–2.75 hours/batch; MacBook Air M4 (thermal throttling under sustained load), ~5.5 hours/batch
-- **Score validation**: a 100-chunk sample was reviewed before committing to the full run — scores were qualitatively sensible (neutral ~67%, positive ~21%, negative ~12%; clearly positive/negative examples validated manually)
+Built with assistance from Claude Code for pipeline scaffolding and iteration.

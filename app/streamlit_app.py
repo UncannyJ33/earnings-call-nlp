@@ -448,6 +448,7 @@ def page_signal_dashboard(df: pd.DataFrame) -> None:
                 customdata=q_summary["n"],
             ))
             fig_q.add_hline(y=0, line_color=C["neutral"], line_width=1)
+            q_pval_str = "<0.001" if q_spread["p_value"] < 0.001 else f"{q_spread['p_value']:.3f}"
             fig_q.update_layout(**chart_layout(
                 height=380, showlegend=False,
                 title=dict(
@@ -455,7 +456,7 @@ def page_signal_dashboard(df: pd.DataFrame) -> None:
                         f"{FEATURE_LABELS[q_feature]} → {CAR_LABELS[q_window]}<br>"
                         f"<sup>Q4−Q1 spread: {q_spread['spread']*100:+.2f}pp  "
                         f"t={q_spread['t_stat']:.2f}  "
-                        f"p={'<0.001' if q_spread['p_value'] < 0.001 else f\"{q_spread['p_value']:.3f}\"}  "
+                        f"p={q_pval_str}  "
                         f"n={q_spread['n_q4']+q_spread['n_q1']:,}</sup>"
                     ),
                     font=dict(size=13),
