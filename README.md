@@ -100,6 +100,17 @@ This introduces survivorship bias. The analysis sample skews toward larger, more
 - **Primary**: market-adjusted CAR — stock return minus SPY return each day, summed over the window
 - **Robustness check**: beta-adjusted CAR — expected return is beta × SPY return, where beta is estimated on the 120 trading days prior to the event (non-overlapping with the CAR window)
 
+### Regression model specification
+
+Two model variants are reported for each CAR window:
+
+- **Full-sample model** (~14,000 events): sentiment features only, no size control. Uses every event with available price data.
+- **Controlled model** (~8,200 events): adds `log(market_cap)` and sector fixed effects as controls. Restricted to tickers for which yfinance returned a market cap — a non-random subsample that skews mid- to large-cap (median $5.0B vs $1.1B for the excluded names).
+
+The full-sample model is the primary specification. The controlled model is a robustness check: if sentiment coefficients are stable across both, the signal is not simply a proxy for size or sector effects. The ~5,800 event gap between the two samples is itself a finding — the analysis cannot be extended to the small-cap universe without a separate market-cap data source.
+
+`earnings_surprise` (analyst consensus beat/miss) is not in the dataset and is omitted. This is an intentional scope decision: the hypothesis under test is whether *how management talks* predicts returns, not whether reported numbers beat expectations. The two signals are correlated in practice — a positive sentiment delta may partly reflect a genuine beat before it is fully priced in — but that is a plausible economic channel rather than a confound to eliminate.
+
 ## FinBERT inference
 
 Model: [ProsusAI/finbert](https://huggingface.co/ProsusAI/finbert) via HuggingFace Transformers. Three output probabilities per chunk: `positive_prob`, `negative_prob`, `neutral_prob` (sum to 1.0).
