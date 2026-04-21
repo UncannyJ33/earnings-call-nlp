@@ -2,6 +2,9 @@
 
 Sentiment analysis of earnings call transcripts using FinBERT, covering 18,755 calls across 2,876 tickers from 2017–2023 (Motley Fool dataset).
 
+![Quantile staircase](figures/signal_quantile_staircase.png)
+*Events sorted by quarter-over-quarter sentiment shift. Q4−Q1 spread: +3.3pp (t=12.87, p<0.001, n=11,810).*
+
 ## Pipeline overview
 
 ```
@@ -19,6 +22,15 @@ Raw transcripts (.pkl)
         ▼
   signal testing      — compare chunking strategies, build return signals
 ```
+
+## Notebooks
+
+| Notebook | Description |
+|---|---|
+| [01_eda.ipynb](notebooks/01_eda.ipynb) | Dataset overview, transcript length, section and speaker distributions |
+| [02_sentiment_analysis.ipynb](notebooks/02_sentiment_analysis.ipynb) | FinBERT score distributions, sentiment by section/role/time, overlap vs non-overlap |
+| [03_signal_testing.ipynb](notebooks/03_signal_testing.ipynb) | Correlation analysis, regression, quantile staircase, sector breakdown, OOS validation |
+| [04_results_summary.ipynb](notebooks/04_results_summary.ipynb) | Executive summary, key charts, limitations |
 
 ## Dataset
 
@@ -126,6 +138,8 @@ Sorting earnings events into quartiles by `sentiment_delta` (quarter-over-quarte
 
 **Q4-Q1 spread: +3.3 percentage points** (Welch t=12.87, p<0.001, n=11,810 events).
 
+![Quantile staircase](figures/signal_quantile_staircase.png)
+
 ### Alpha decay
 
 The Q4-Q1 spread by year shows no evidence of monotonic decay:
@@ -139,6 +153,8 @@ The Q4-Q1 spread by year shows no evidence of monotonic decay:
 | 2023 | +6.43% | No (n=80, partial year) |
 
 2017–2018 are excluded: `sentiment_delta` requires a prior-quarter call, so 2017 has zero valid observations and 2018 fewer than 50. The 2021 dip (lowest spread at +2.5%) coincides with the meme-stock / COVID-recovery regime — anomalous market conditions rather than structural decay. The signal recovers fully in 2022.
+
+![Alpha decay](figures/signal_alpha_decay.png)
 
 ### Sector breakdown
 
@@ -154,6 +170,8 @@ The pattern is economically coherent:
 - **Basic Materials**: Same commodity-cycle logic as Energy.
 - **Communication Services**: A mixed sector spanning regulated legacy telecom (Utilities-like) and growth streaming/social (Tech-like); the two sub-groups likely offset each other.
 - **Financial Services**: Heavily compliance-constrained language reduces FinBERT's discriminating power; investors focus on loan book quality, NIM, and capital ratios rather than tone.
+
+![Sector breakdown](figures/signal_sector_heatmap.png)
 
 ## FinBERT inference
 
